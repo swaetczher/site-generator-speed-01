@@ -1,10 +1,14 @@
-// Pengganti makefun-site 1.0.0 yang lebih cepat, ditulis dari nol.
+// Pengganti makefun-site 1.0.0 yang lebih cepat, ronde 2 — ditulis dari nol.
 // Semantik byte-identik dengan referensi (README + kode vendor kit ini).
-// Optimasi: inline Markdown satu-pass dengan pencarian pemicu regex native,
-// template dikompilasi jadi fungsi JS dari AST (fallback interpreter bila
-// codegen gagal), cache slugify per-build, hitung kata tanpa alokasi array,
-// trim baris manual, card dibangun sekali per sumber. Tanpa cache antar
-// case: semua cache dibuat baru di dalam run().
+// Bedanya dari ronde 1: template TIDAK dikompilasi (diukur di proses fresh,
+// interpreter imbang dengan kompilasi, dan kompilasi 21-27 template per case
+// hanya menambah kerja); sebagai gantinya jalur panas dipangkas alokasinya:
+// inline Markdown bekerja atas rentang (tanpa slice untuk em/strong/link),
+// render Markdown menumpuk ke satu array, scope loop dipakai ulang,
+// pencarian penutup inline memakai indexOf native, slugify punya jalur
+// cepat ASCII, front matter tanpa objek pembungkus baris, dan \r hanya
+// di-replace bila ada. Tanpa cache antar case: semua cache dibuat baru
+// di dalam run().
 
 const RESERVED = ['posts', 'tags', 'page'];
 const REPORT_FILE = 'build-report.txt';
@@ -23,27 +27,41 @@ function escapeHtml(text) {
   return ESC_TEST.test(text) ? text.replace(ESC_RE, (c) => ESCAPES[c]) : text;
 }
 
+/** Jalur cepat slug ASCII: huruf ASCII saja yang berubah (NFKD identitas). */
+const ASCII_ONLY = /^[\x00-\x7F]*$/;
+const NON_ALNUM = /[^a-z0-9]+/g;
+const LEAD_TRAIL_DASH = /^-+|-+$/g;
+
 /** Slug dari `text` (aturan README "Text"), dengan cache per-build `cx.slugCache`. */
 function slugify(cx, text) {
   const hit = cx.slugCache.get(text);
   if (hit !== undefined) return hit;
-  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
-  let out = '';
-  let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
-      gap = out.length > 0;
-      continue;
+  let slug;
+  if (ASCII_ONLY.test(text)) {
+    // Sama persis dengan loop di bawah untuk input ASCII: NFKD tidak mengubah
+    // ASCII, huruf besar jadi kecil, selain a-z0-9 jadi pemisah satu '-'.
+    let out = text.toLowerCase().replace(NON_ALNUM, '-').replace(LEAD_TRAIL_DASH, '');
+    out = out.slice(0, 64).replace(/-+$/, '');
+    slug = out === '' ? 'untitled' : out;
+  } else {
+    const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+    let out = '';
+    let gap = false;
+    for (const ch of plain) {
+      let keep = null;
+      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+      if (keep === null) {
+        gap = out.length > 0;
+        continue;
+      }
+      if (gap) out += '-';
+      gap = false;
+      out += keep;
     }
-    if (gap) out += '-';
-    gap = false;
-    out += keep;
+    out = out.slice(0, 64).replace(/-+$/, '');
+    slug = out === '' ? 'untitled' : out;
   }
-  out = out.slice(0, 64).replace(/-+$/, '');
-  const slug = out === '' ? 'untitled' : out;
   cx.slugCache.set(text, slug);
   return slug;
 }
@@ -64,7 +82,7 @@ function longDate(date) {
 
 /**
  * Kata-kata sebuah body: run karakter bukan whitespace. Dihitung manual
- * tanpa alokasi array (match(/\S+/g) mengalokasi satu string per kata).
+ * tanpa alokasi array (match(/\S+/g) terukur 1,7x lebih lambat).
  * Himpunan whitespace sama persis dengan \s JavaScript.
  */
 function wordsOf(text) {
@@ -97,6 +115,19 @@ function wordsOf(text) {
 /** `rel` dari direktori `dir` sebuah sumber, atau null bila naik di atas root. */
 function resolvePath(dir, rel) {
   const parts = dir === '' ? [] : dir.split('/');
+  for (const seg of rel.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (parts.length === 0) return null;
+      parts.pop();
+    } else parts.push(seg);
+  }
+  return parts.join('/');
+}
+
+/** Sama dengan resolvePath, tapi `dirParts` sudah di-split sekali per halaman. */
+function resolveFromParts(dirParts, rel) {
+  const parts = dirParts.slice();
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
     if (seg === '..') {
@@ -197,7 +228,9 @@ function valueOf(key, raw) {
 
 /**
  * Front matter + body sebuah sumber: { data, body }, atau { error }.
- * Dipindai baris demi baris tanpa split atas seluruh teks (body besar).
+ * Baris front matter dikumpulkan dulu sebagai string polos (tanpa objek
+ * pembungkus), baru divalidasi setelah yakin bloknya tertutup — urutan
+ * error sama persis dengan referensi (blok tak tertutup dilaporkan dulu).
  */
 function parseFrontMatter(text) {
   const n = text.length;
@@ -212,23 +245,23 @@ function parseFrontMatter(text) {
   const first = nextLine();
   if (first === null || first !== '---') return { error: 'no front matter' };
   const fmLines = [];
-  let lineNo = 1;
   let closed = false;
   let bodyStart = -1;
   while (true) {
     const line = nextLine();
     if (line === null) break;
-    lineNo++;
     if (line === '---') {
       closed = true;
       bodyStart = pos;
       break;
     }
-    fmLines.push({ line, no: lineNo });
+    fmLines.push(line);
   }
   if (!closed) return { error: 'the front matter is not closed' };
   const data = {};
-  for (const { line, no } of fmLines) {
+  for (let i = 0; i < fmLines.length; i++) {
+    const line = fmLines[i];
+    const no = i + 2;
     if (isBlankLine(line) || line.startsWith('#')) continue;
     const m = FM_LINE.exec(line);
     if (!m) return { error: `line ${no} is not "key: value"` };
@@ -261,29 +294,42 @@ const TRIG = /[\\`*\[]/g;
 /** Karakter yang di-escape oleh backslash. */
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 
-/** Indeks pertama `what` di `s` dari `from`, di luar escape backslash, atau -1. */
-function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+/**
+ * Jumlah backslash berurutan tepat sebelum posisi `j`, dihitung mundur
+ * sampai `from`. Ganjil = karakter di `j` di-escape; genap = tidak.
+ * Sama dengan pemindaian karakter-demi-karakter referensi: backslash
+ * meng-escape karakter berikut hanya bila ia sendiri tidak di-escape.
+ */
+function bsCount(s, j, from) {
+  let n = 0;
+  while (j - 1 - n >= from && s[j - 1 - n] === '\\') n++;
+  return n;
+}
+
+/**
+ * Indeks pertama `what` di `s` dari `from` sampai `hi` (cocok harus berakhir
+ * di dalam `hi`), di luar escape backslash, atau -1. Pencarian memakai
+ * indexOf native — terukur ~13x lebih cepat dari loop per karakter.
+ */
+function findUnescaped(s, what, from, hi) {
+  let j = s.indexOf(what, from);
+  while (j !== -1 && j + what.length <= hi) {
+    if (bsCount(s, j, from) % 2 === 0) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
-/** Indeks `*` tunggal pertama dari `from` (bukan bagian `**`), di luar escape, atau -1. */
-function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
+/** Indeks `*` tunggal pertama dari `from` sampai `hi` (bukan bagian `**`), di luar escape, atau -1. */
+function findSingleStar(s, from, hi) {
+  let j = s.indexOf('*', from);
+  while (j !== -1 && j < hi) {
+    if (bsCount(s, j, from) % 2 === 1) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== '*') continue;
-    if (s[j + 1] === '*') {
-      j++;
+    if (j + 1 < hi && s[j + 1] === '*') {
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
@@ -292,27 +338,28 @@ function findSingleStar(s, from) {
 }
 
 /**
- * `s` dirender inline, potongan-potongan ditambahkan ke array `out`.
- * Pemindai satu-pass: regex native mencari pemicu konstruk berikutnya,
- * run teks biasa di antaranya di-escape sekali; pemicu yang ternyata
- * literal tetap tinggal di dalam run (runStart tidak ikut maju).
- * (TRIG dipakai ulang antar pemanggilan rekursif, tapi lastIndex selalu
- * disetel sebelum tiap exec, jadi aman.)
+ * Rentang `s[lo..hi)` dirender inline, potongan-potongan ditambahkan ke
+ * array `out`. Pemindai satu-pass: regex native mencari pemicu konstruk
+ * berikutnya, run teks biasa di antaranya di-escape sekali; pemicu yang
+ * ternyata literal tetap tinggal di dalam run (runStart tidak ikut maju).
+ * Rekursi untuk em/strong/link memakai rentang, bukan slice — tanpa
+ * alokasi string per konstruk. (TRIG dipakai ulang antar pemanggilan
+ * rekursif, tapi lastIndex selalu disetel sebelum tiap exec, jadi aman.)
  */
-function inlineInto(out, s, env) {
-  let runStart = 0;
-  let pos = 0;
+function inlineRange(out, s, lo, hi, env) {
+  let runStart = lo;
+  let pos = lo;
   while (true) {
     TRIG.lastIndex = pos;
     const m = TRIG.exec(s);
-    const j = m === null ? s.length : m.index;
-    if (m === null) {
-      if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
+    if (m === null || m.index >= hi) {
+      if (hi > runStart) out.push(escapeHtml(s.slice(runStart, hi)));
       return;
     }
+    const j = m.index;
     const c = s[j];
     if (c === '\\') {
-      if (j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+      if (j + 1 < hi && ESCAPABLE.has(s[j + 1])) {
         if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
         out.push(escapeHtml(s[j + 1]));
         pos = j + 2;
@@ -322,7 +369,7 @@ function inlineInto(out, s, env) {
     }
     if (c === '`') {
       const k = s.indexOf('`', j + 1);
-      if (k > j + 1) {
+      if (k !== -1 && k < hi && k > j + 1) {
         if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
         out.push('<code>', escapeHtml(s.slice(j + 1, k)), '</code>');
         pos = k + 1;
@@ -331,22 +378,22 @@ function inlineInto(out, s, env) {
       continue;
     }
     if (c === '*') {
-      if (s[j + 1] === '*') {
-        const k = findUnescaped(s, '**', j + 2);
+      if (j + 1 < hi && s[j + 1] === '*') {
+        const k = findUnescaped(s, '**', j + 2, hi);
         if (k > j + 2) {
           if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
           out.push('<strong>');
-          inlineInto(out, s.slice(j + 2, k), env);
+          inlineRange(out, s, j + 2, k, env);
           out.push('</strong>');
           pos = k + 2;
           runStart = pos;
         } else pos = j + 2;
       } else {
-        const k = findSingleStar(s, j + 1);
+        const k = findSingleStar(s, j + 1, hi);
         if (k > j + 1) {
           if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
           out.push('<em>');
-          inlineInto(out, s.slice(j + 1, k), env);
+          inlineRange(out, s, j + 1, k, env);
           out.push('</em>');
           pos = k + 1;
           runStart = pos;
@@ -354,13 +401,13 @@ function inlineInto(out, s, env) {
       }
       continue;
     }
-    const k = findUnescaped(s, ']', j + 1);
-    const m2 = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-    const target = m2 === -1 ? '' : s.slice(k + 2, m2);
-    if (target !== '' && !WS_TARGET.test(target)) {
+    const k = findUnescaped(s, ']', j + 1, hi);
+    const m2 = k !== -1 && k + 1 < hi && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+    const target = m2 !== -1 && m2 < hi ? s.slice(k + 2, m2) : '';
+    if (m2 !== -1 && m2 < hi && target !== '' && !WS_TARGET.test(target)) {
       if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
       out.push('<a href="', escapeHtml(env.link(target)), '">');
-      inlineInto(out, s.slice(j + 1, k), env);
+      inlineRange(out, s, j + 1, k, env);
       out.push('</a>');
       pos = m2 + 1;
       runStart = pos;
@@ -371,7 +418,7 @@ function inlineInto(out, s, env) {
 /** `s` dirender inline menjadi satu string. */
 function inline(s, env) {
   const out = [];
-  inlineInto(out, s, env);
+  inlineRange(out, s, 0, s.length, env);
   return out.join('');
 }
 
@@ -390,13 +437,26 @@ function isHr(line) {
   if (c !== 45 && c !== 42) return false;
   return HR.test(line);
 }
+/**
+ * Apakah `line` mengakhiri paragraf. Sama persis dengan gabungan empat cek
+ * referensi, tapi dispatch dari karakter pertama: baris teks biasa (huruf)
+ * langsung false tanpa empat panggilan fungsi.
+ */
 function endsParagraph(line) {
-  return isBlankLine(line) || fenceOpenOf(line) !== null || headingOf(line) !== null || isHr(line);
+  if (line.length === 0) return true;
+  const c = line.charCodeAt(0);
+  if (c === 32 || c === 9) return isBlankLine(line);
+  if (c === 35) return headingOf(line) !== null;
+  if (c === 96) return fenceOpenOf(line) !== null;
+  if (c === 45 || c === 42) return isHr(line);
+  return false;
 }
 
 /**
  * `src` dirender: HTML-nya, daftar isi (heading level 2-3) dan excerpt
- * (HTML paragraf pertama, atau ""). Lexer + render satu-pass, tanpa array token.
+ * (HTML paragraf pertama, atau ""). Lexer + render satu-pass ke satu array
+ * `out` (tanpa array blok + map + join per blok); excerpt diambil dari
+ * potongan array paragraf pertama.
  */
 function renderMarkdown(cx, src, env) {
   const n = src.length;
@@ -409,7 +469,7 @@ function renderMarkdown(cx, src, env) {
     return line;
   };
   const ids = new Set();
-  const blocks = [];
+  const out = [];
   const toc = [];
   let excerpt = null;
   let cur = nextLine();
@@ -430,20 +490,20 @@ function renderMarkdown(cx, src, env) {
       if (cur !== null) cur = nextLine();
       const cls = fence[1] === '' ? '' : ` class="language-${escapeHtml(fence[1])}"`;
       const code = body.length === 0 ? '' : escapeHtml(`${body.join('\n')}\n`);
-      blocks.push(`<pre><code${cls}>${code}</code></pre>`);
+      out.push(`<pre><code${cls}>${code}</code></pre>\n`);
       continue;
     }
     const heading = headingOf(line);
     if (heading !== null) {
       const id = uniqueSlug(slugify(cx, heading.text), ids);
       const html = inline(heading.text, env);
-      blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>`);
+      out.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>\n`);
       if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
       cur = nextLine();
       continue;
     }
     if (isHr(line)) {
-      blocks.push('<hr>');
+      out.push('<hr>\n');
       cur = nextLine();
       continue;
     }
@@ -454,7 +514,13 @@ function renderMarkdown(cx, src, env) {
         cur = nextLine();
       }
       const lines = body.map(trimLine).filter((l) => l !== '');
-      blocks.push(lines.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(lines.join('\n'), env)}</p>\n</blockquote>`);
+      if (lines.length === 0) out.push('<blockquote>\n</blockquote>\n');
+      else {
+        const text = lines.join('\n');
+        out.push('<blockquote>\n<p>');
+        inlineRange(out, text, 0, text.length, env);
+        out.push('</p>\n</blockquote>\n');
+      }
       continue;
     }
     const c0 = line.charCodeAt(0);
@@ -479,9 +545,14 @@ function renderMarkdown(cx, src, env) {
       const tag = isOrdered ? 'ol' : 'ul';
       const start = isOrdered ? Number(ordered[1]) : 1;
       const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
-      const lis = [];
-      for (const item of items) lis.push(`<li>${inline(item.join('\n'), env)}</li>\n`);
-      blocks.push(`${open}\n${lis.join('')}</${tag}>`);
+      out.push(`${open}\n`);
+      for (const item of items) {
+        const text = item.join('\n');
+        out.push('<li>');
+        inlineRange(out, text, 0, text.length, env);
+        out.push('</li>\n');
+      }
+      out.push(`</${tag}>\n`);
       continue;
     }
     const body = [trimLine(line)];
@@ -490,11 +561,14 @@ function renderMarkdown(cx, src, env) {
       body.push(trimLine(cur));
       cur = nextLine();
     }
-    const html = inline(body.join('\n'), env);
-    if (excerpt === null) excerpt = html;
-    blocks.push(`<p>${html}</p>`);
+    const html = body.join('\n');
+    out.push('<p>');
+    const mark = out.length;
+    inlineRange(out, html, 0, html.length, env);
+    if (excerpt === null) excerpt = out.slice(mark).join('');
+    out.push('</p>\n');
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html: out.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- Template
@@ -627,7 +701,9 @@ function truthy(v) {
 
 /**
  * Node-node dirender dalam `scope`, potongan ditambahkan ke array `out`.
- * Dipakai sebagai fallback bila kompilasi sebuah template gagal.
+ * Loop `for` memakai satu objek scope yang dipakai ulang tiap iterasi
+ * (render berjalan sinkron; scope tidak disimpan setelah iterasi selesai)
+ * — menghemat satu objek vars + satu objek loop per item.
  */
 function renderNodes(nodes, scope, ctx, depth, out) {
   for (const n of nodes) {
@@ -650,9 +726,17 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       case 'for': {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
+        const child = { vars: {}, parent: scope };
+        const loop = { index: 0, first: false, last: false, length: xs.length };
         for (let k = 0; k < xs.length; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-          renderNodes(n.body, { vars, parent: scope }, ctx, depth, out);
+          // Item dulu, lalu loop — supaya bila nama loop-nya 'loop', objek
+          // loop yang menang, sama seperti literal objek referensi.
+          child.vars[n.name] = xs[k];
+          child.vars.loop = loop;
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === xs.length - 1;
+          renderNodes(n.body, child, ctx, depth, out);
         }
         break;
       }
@@ -665,52 +749,6 @@ function renderNodes(nodes, scope, ctx, depth, out) {
   }
 }
 
-/**
- * AST template dikompilasi menjadi fungsi JS
- * (scope, ctx, depth, out, L, textOf, truthy, escapeHtml).
- * Semantiknya sama persis dengan renderNodes: lookup rantai scope, textOf,
- * truthy, include sedalam < 8. Bila codegen gagal, kembalikan null.
- */
-function compileTemplate(nodes) {
-  let code = '';
-  let uid = 0;
-  const gen = (ns, scopeVar) => {
-    for (const n of ns) {
-      if (n.kind === 'text') code += `out.push(${JSON.stringify(n.text)});`;
-      else if (n.kind === 'var') code += `out.push(escapeHtml(textOf(L(${scopeVar},${JSON.stringify(n.path)}))));`;
-      else if (n.kind === 'raw') code += `out.push(textOf(L(${scopeVar},${JSON.stringify(n.path)})));`;
-      else if (n.kind === 'if') {
-        code += `if(truthy(L(${scopeVar},${JSON.stringify(n.path)}))!==${n.not}){`;
-        gen(n.then, scopeVar);
-        code += '}';
-        if (n.else !== null) {
-          code += 'else{';
-          gen(n.else, scopeVar);
-          code += '}';
-        }
-      } else if (n.kind === 'for') {
-        uid++;
-        const v = `s${uid}`;
-        const xs = `x${uid}`;
-        const k = `k${uid}`;
-        code += `var ${xs}=L(${scopeVar},${JSON.stringify(n.path)});if(Array.isArray(${xs})){for(var ${k}=0;${k}<${xs}.length;${k}++){var ${v}={vars:{${JSON.stringify(n.name)}:${xs}[${k}],loop:{index:${k}+1,first:${k}===0,last:${k}===${xs}.length-1,length:${xs}.length}},parent:${scopeVar}};`;
-        gen(n.body, v);
-        code += '}}';
-      } else if (n.kind === 'include') {
-        uid++;
-        const f = `f${uid}`;
-        code += `var ${f}=ctx.fns.get(${JSON.stringify(n.name)});if(${f}&&depth<8)${f}(${scopeVar},ctx,depth+1,out,L,textOf,truthy,escapeHtml);`;
-      }
-    }
-  };
-  try {
-    gen(nodes, 'scope');
-    return new Function('scope', 'ctx', 'depth', 'out', 'L', 'textOf', 'truthy', 'escapeHtml', code);
-  } catch {
-    return null;
-  }
-}
-
 // ---------------------------------------------------------------- build
 
 /** Rekaman link sebuah halaman seperti template membacanya. */
@@ -720,13 +758,10 @@ const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, da
 function build(input) {
   const cx = { slugCache: new Map() };
   const templates = new Map();
-  const fns = new Map();
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      const nodes = parseTemplate(name, input.templates[name]);
-      templates.set(name, nodes);
-      fns.set(name, compileTemplate(nodes));
+      templates.set(name, parseTemplate(name, input.templates[name]));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
@@ -738,7 +773,8 @@ function build(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    // Kebanyakan file tanpa \r: lewati replace bila tidak ada.
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else statics.push({ path: f.path, content: f.content });
   }
   // 2. Front matter + cek penolakan berurutan.
@@ -793,13 +829,14 @@ function build(input) {
   const broken = new Set();
   for (const s of kept) {
     const dir = dirOf(s.path);
+    const dirParts = dir === '' ? [] : dir.split('/');
     const env = {
       link: (target) => {
         if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
+        const path = rel === '' ? null : resolveFromParts(dirParts, rel);
         if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
         if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
         broken.add(`broken-link ${s.path} -> ${target}`);
@@ -862,27 +899,39 @@ function build(input) {
   const cards = new Map();
   for (const p of posts) cards.set(p, cardOf(p));
   for (const s of kept) s.card = s.post ? cards.get(s) : cardOf(s);
-  const pageOf = (s) => ({
-    ...s.card,
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
-    is_post: s.post,
-  });
+  // Objek halaman ditulis eksplisit (tanpa spread) dengan field yang sama
+  // persis seperti referensi; toc dipakai langsung (nilainya identik —
+  // template hanya membaca level/id/html, tidak bisa membedakan identitas).
+  const pageOf = (s) => {
+    const c = s.card;
+    return {
+      title: c.title,
+      url: c.url,
+      date: c.date,
+      date_long: c.date_long,
+      summary: c.summary,
+      excerpt: c.excerpt,
+      reading_minutes: c.reading_minutes,
+      tags: c.tags,
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc,
+      newer: linkOf(s.newer ?? null),
+      older: linkOf(s.older ?? null),
+      is_post: s.post,
+    };
+  };
   const tagOf = (t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) });
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, fns, escape: escapeHtml };
+  const ctx = { templates, escape: escapeHtml };
   const render = (name, vars) => {
-    const fn = fns.get(name);
-    if (fn === undefined) return null;
+    const nodes = templates.get(name);
+    if (nodes === undefined) return null;
     const out = [];
     const scope = { vars: { site, tags: allTags, recent, ...vars }, parent: null };
-    if (fn === null) renderNodes(templates.get(name), scope, ctx, 0, out);
-    else fn(scope, ctx, 0, out, lookup, textOf, truthy, escapeHtml);
+    renderNodes(nodes, scope, ctx, 0, out);
     return out.join('');
   };
   const output = {};
