@@ -1,14 +1,19 @@
-// Pengganti makefun-site 1.0.0 yang lebih cepat, ronde 2 — ditulis dari nol.
+// Pengganti makefun-site 1.0.0 yang lebih cepat, ronde 3 — ditulis dari nol.
 // Semantik byte-identik dengan referensi (README + kode vendor kit ini).
-// Bedanya dari ronde 1: template TIDAK dikompilasi (diukur di proses fresh,
-// interpreter imbang dengan kompilasi, dan kompilasi 21-27 template per case
-// hanya menambah kerja); sebagai gantinya jalur panas dipangkas alokasinya:
-// inline Markdown bekerja atas rentang (tanpa slice untuk em/strong/link),
-// render Markdown menumpuk ke satu array, scope loop dipakai ulang,
-// pencarian penutup inline memakai indexOf native, slugify punya jalur
-// cepat ASCII, front matter tanpa objek pembungkus baris, dan \r hanya
-// di-replace bila ada. Tanpa cache antar case: semua cache dibuat baru
-// di dalam run().
+// Lompatan struktural ronde 3 dibanding ronde 2 (interpreter + pemangkas
+// alokasi): template TIDAK dirender berulang-ulang bila hasilnya sudah
+// pasti sama. Setiap include dianalisis statis atas AST-nya (variabel bebas
+// transitif): bila include hanya membaca nilai level-case (site/tags/recent)
+// ia dirender SEKALI per case dan dipakai ulang; bila ia hanya bergantung
+// pada satu variabel loop (mis. kartu post `p`) ia dirender sekali per nilai
+// variabel itu (satu kartu post dirender sekali, bukan di tiap index/tag
+// page). Pemeriksaan saat render memastikan nama yang dibaca tidak
+// ter-shadow oleh loop di tempat include itu dipakai; bila ragu, render
+// normal. Penjaga kedalaman include (maks 8) tetap dihormati. Selain itu
+// pemindai inline Markdown memakai satu regex perhatian saja (pemicu konstruk
+// + karakter yang harus di-escape), jadi tiap run teks biasa tidak lagi
+// dipindai dua kali. Tanpa cache antar case: semua memo dibuat baru di
+// dalam run() dan dibuang setelah satu case selesai.
 
 const RESERVED = ['posts', 'tags', 'page'];
 const REPORT_FILE = 'build-report.txt';
@@ -288,8 +293,15 @@ const BULLET = /^[-*] (.*)$/;
 const ORDERED = /^(\d{1,9})\. (.*)$/;
 const CONTINUED = /^ {2,}\S/;
 const WS_TARGET = /\s/;
-/** Karakter pemicu konstruk inline; pencarian berikutnya lewat regex native. */
-const TRIG = /[\\`*\[]/g;
+/**
+ * Satu regex perhatian untuk pemindai inline: pemicu konstruk
+ * (`\`, backtick, `*`, `[`) DAN karakter yang harus di-escape HTML
+ * (`& < > " '`). Pemindai hanya berhenti di karakter-karakter ini, jadi
+ * sebuah run teks biasa di antara dua perhentian dijamin bebas karakter
+ * escape dan bisa didorong apa adanya — tanpa pemindaian escape terpisah
+ * per run seperti sebelumnya.
+ */
+const ATTN = /[\\`*\[&<>"']/g;
 
 /** Karakter yang di-escape oleh backslash. */
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
@@ -339,29 +351,37 @@ function findSingleStar(s, from, hi) {
 
 /**
  * Rentang `s[lo..hi)` dirender inline, potongan-potongan ditambahkan ke
- * array `out`. Pemindai satu-pass: regex native mencari pemicu konstruk
- * berikutnya, run teks biasa di antaranya di-escape sekali; pemicu yang
- * ternyata literal tetap tinggal di dalam run (runStart tidak ikut maju).
- * Rekursi untuk em/strong/link memakai rentang, bukan slice — tanpa
- * alokasi string per konstruk. (TRIG dipakai ulang antar pemanggilan
- * rekursif, tapi lastIndex selalu disetel sebelum tiap exec, jadi aman.)
+ * array `out`. Pemindai satu-pass: regex native mencari karakter perhatian
+ * berikutnya; run teks biasa di antaranya didorong apa adanya (dijamin
+ * bebas karakter escape); pemicu yang ternyata literal tetap tinggal di
+ * dalam run (runStart tidak ikut maju). Rekursi untuk em/strong/link
+ * memakai rentang, bukan slice — tanpa alokasi string per konstruk.
+ * (ATTN dipakai ulang antar pemanggilan rekursif, tapi lastIndex selalu
+ * disetel sebelum tiap exec, jadi aman.)
  */
 function inlineRange(out, s, lo, hi, env) {
   let runStart = lo;
   let pos = lo;
   while (true) {
-    TRIG.lastIndex = pos;
-    const m = TRIG.exec(s);
+    ATTN.lastIndex = pos;
+    const m = ATTN.exec(s);
     if (m === null || m.index >= hi) {
-      if (hi > runStart) out.push(escapeHtml(s.slice(runStart, hi)));
+      if (hi > runStart) out.push(s.slice(runStart, hi));
       return;
     }
     const j = m.index;
     const c = s[j];
+    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
+      if (j > runStart) out.push(s.slice(runStart, j));
+      out.push(ESCAPES[c]);
+      pos = j + 1;
+      runStart = pos;
+      continue;
+    }
     if (c === '\\') {
       if (j + 1 < hi && ESCAPABLE.has(s[j + 1])) {
-        if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
-        out.push(escapeHtml(s[j + 1]));
+        if (j > runStart) out.push(s.slice(runStart, j));
+        out.push(ESCAPES[s[j + 1]] ?? s[j + 1]);
         pos = j + 2;
         runStart = pos;
       } else pos = j + 1;
@@ -370,7 +390,7 @@ function inlineRange(out, s, lo, hi, env) {
     if (c === '`') {
       const k = s.indexOf('`', j + 1);
       if (k !== -1 && k < hi && k > j + 1) {
-        if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
+        if (j > runStart) out.push(s.slice(runStart, j));
         out.push('<code>', escapeHtml(s.slice(j + 1, k)), '</code>');
         pos = k + 1;
         runStart = pos;
@@ -381,7 +401,7 @@ function inlineRange(out, s, lo, hi, env) {
       if (j + 1 < hi && s[j + 1] === '*') {
         const k = findUnescaped(s, '**', j + 2, hi);
         if (k > j + 2) {
-          if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
+          if (j > runStart) out.push(s.slice(runStart, j));
           out.push('<strong>');
           inlineRange(out, s, j + 2, k, env);
           out.push('</strong>');
@@ -391,7 +411,7 @@ function inlineRange(out, s, lo, hi, env) {
       } else {
         const k = findSingleStar(s, j + 1, hi);
         if (k > j + 1) {
-          if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
+          if (j > runStart) out.push(s.slice(runStart, j));
           out.push('<em>');
           inlineRange(out, s, j + 1, k, env);
           out.push('</em>');
@@ -405,7 +425,7 @@ function inlineRange(out, s, lo, hi, env) {
     const m2 = k !== -1 && k + 1 < hi && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
     const target = m2 !== -1 && m2 < hi ? s.slice(k + 2, m2) : '';
     if (m2 !== -1 && m2 < hi && target !== '' && !WS_TARGET.test(target)) {
-      if (j > runStart) out.push(escapeHtml(s.slice(runStart, j)));
+      if (j > runStart) out.push(s.slice(runStart, j));
       out.push('<a href="', escapeHtml(env.link(target)), '">');
       inlineRange(out, s, j + 1, k, env);
       out.push('</a>');
@@ -579,6 +599,11 @@ const T_FOR = /^for ([A-Za-z_][A-Za-z0-9_]*) in (\S+)$/;
 const T_IF = /^if (not )?(\S+)$/;
 const T_INCLUDE = /^include "([a-z0-9-]+)"$/;
 
+/** Nama root yang nilainya sama untuk semua halaman dalam satu case. */
+const CASE_ROOTS = new Set(['site', 'tags', 'recent']);
+/** Nama root yang nilainya berbeda per halaman/render (tidak boleh di-memo). */
+const PAGE_ROOTS = new Set(['page', 'posts', 'tag', 'pager']);
+
 /** Template yang tidak parse: nama + alasannya. */
 class TemplateError extends Error {}
 
@@ -699,11 +724,132 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+// ------------------------------------------------------- analisis memo template
+
+/**
+ * Variabel bebas + nama include dari node-node, dengan `bound` = nama yang
+ * terikat oleh for di sekitar (di dalam template ini sendiri).
+ */
+function collectFree(nodes, bound, out) {
+  for (const n of nodes) {
+    if (n.kind === 'var' || n.kind === 'raw') {
+      if (!bound.has(n.path[0])) out.vars.add(n.path[0]);
+    } else if (n.kind === 'if') {
+      if (!bound.has(n.path[0])) out.vars.add(n.path[0]);
+      collectFree(n.then, bound, out);
+      if (n.else !== null) collectFree(n.else, bound, out);
+    } else if (n.kind === 'for') {
+      if (!bound.has(n.path[0])) out.vars.add(n.path[0]);
+      const b2 = new Set(bound);
+      b2.add(n.name);
+      b2.add('loop');
+      collectFree(n.body, b2, out);
+    } else if (n.kind === 'include') out.includes.push(n.name);
+  }
+}
+
+/**
+ * Klasifikasi tiap template yang ter-parse, untuk memo include:
+ * - kind 0 (volatil): output bergantung pada halaman/render — render normal.
+ * - kind 1 (case-constant): hanya membaca site/tags/recent (atau nama yang
+ *   tidak terikat di mana pun) — render sekali per case, pakai ulang.
+ * - kind 2 (per-nilai): selain nilai case, hanya bergantung pada SATU
+ *   variabel loop (mis. kartu post `p`) — render sekali per nilai itu.
+ * Analisisnya transitif (include bersarang ikut dihitung) dan titik-tetap
+ * (siklus include ditangani: iterasi sampai stabil). `nest` = rantai
+ * include terpanjang dari template ini (siklus -> 8, memo dimatikan).
+ */
+function analyzeTemplates(templates) {
+  const direct = new Map();
+  for (const [name, nodes] of templates) {
+    const out = { vars: new Set(), includes: [] };
+    collectFree(nodes, new Set(), out);
+    direct.set(name, out);
+  }
+  const rawFree = new Map();
+  for (const [name, d] of direct) rawFree.set(name, new Set(d.vars));
+  let changed = true;
+  let guard = 0;
+  while (changed && guard++ < 40) {
+    changed = false;
+    for (const [name, d] of direct) {
+      const s = rawFree.get(name);
+      for (const inc of d.includes) {
+        const f = rawFree.get(inc);
+        if (f === undefined) continue;
+        for (const v of f) {
+          if (!s.has(v)) {
+            s.add(v);
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+  const nestMemo = new Map();
+  const nest = (name, visiting) => {
+    if (nestMemo.has(name)) return nestMemo.get(name);
+    if (visiting.has(name)) return 8;
+    const d = direct.get(name);
+    if (d === undefined) return 0;
+    visiting.add(name);
+    let m = 0;
+    for (const inc of d.includes) m = Math.max(m, 1 + nest(inc, visiting));
+    visiting.delete(name);
+    nestMemo.set(name, m);
+    return m;
+  };
+  const classes = new Map();
+  for (const [name] of direct) {
+    const free = rawFree.get(name);
+    const n = nest(name, new Set());
+    let kind = 0;
+    let keyVar = null;
+    if (n < 8) {
+      let volatile = false;
+      const keys = [];
+      for (const v of free) {
+        if (PAGE_ROOTS.has(v)) {
+          volatile = true;
+          break;
+        }
+        if (!CASE_ROOTS.has(v)) keys.push(v);
+      }
+      if (!volatile) {
+        if (keys.length === 0) kind = 1;
+        else if (keys.length === 1 && keys[0] !== 'loop') {
+          kind = 2;
+          keyVar = keys[0];
+        }
+      }
+    }
+    classes.set(name, { kind, keyVar, free: [...free], nest: n });
+  }
+  return classes;
+}
+
+/**
+ * Apakah nama `v` di `scope` terikat di scope akar (nilai level-case) atau
+ * tidak terikat di mana pun (undefined — konstan). Bila terikat di scope
+ * loop di tengah rantai, jawabannya false: nilainya bisa berbeda per
+ * halaman/iterasi, jadi memo tidak boleh dipakai di tempat ini.
+ */
+function resolvesFromRoot(scope, v) {
+  let s = scope;
+  while (s !== null) {
+    if (Object.hasOwn(s.vars, v)) return s.parent === null;
+    s = s.parent;
+  }
+  return true;
+}
+
 /**
  * Node-node dirender dalam `scope`, potongan ditambahkan ke array `out`.
  * Loop `for` memakai satu objek scope yang dipakai ulang tiap iterasi
- * (render berjalan sinkron; scope tidak disimpan setelah iterasi selesai)
- * — menghemat satu objek vars + satu objek loop per item.
+ * (render berjalan sinkron; scope tidak disimpan setelah iterasi selesai).
+ * Include yang terklasifikasi case-constant / per-nilai dirender sekali
+ * dan dipakai ulang (dengan pemeriksaan resolvesFromRoot + penjaga
+ * kedalaman); bila pemeriksaan gagal, render normal seperti biasa.
  */
 function renderNodes(nodes, scope, ctx, depth, out) {
   for (const n of nodes) {
@@ -742,7 +888,49 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+        if (t === undefined || depth >= INCLUDE_DEPTH) break;
+        const cls = ctx.memo.get(n.name);
+        if (cls === undefined || cls.kind === 0 || depth + cls.nest >= INCLUDE_DEPTH) {
+          renderNodes(t, scope, ctx, depth + 1, out);
+          break;
+        }
+        let ok = true;
+        for (const v of cls.free) {
+          if (v === cls.keyVar) continue;
+          if (!resolvesFromRoot(scope, v)) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) {
+          renderNodes(t, scope, ctx, depth + 1, out);
+          break;
+        }
+        if (cls.kind === 1) {
+          let hit = ctx.memoConst.get(n.name);
+          if (hit === undefined) {
+            const tmp = [];
+            renderNodes(t, scope, ctx, depth + 1, tmp);
+            hit = tmp.join('');
+            ctx.memoConst.set(n.name, hit);
+          }
+          out.push(hit);
+        } else {
+          const keyVal = lookup(scope, [cls.keyVar]);
+          let m = ctx.memoVal.get(n.name);
+          if (m === undefined) {
+            m = new Map();
+            ctx.memoVal.set(n.name, m);
+          }
+          let hit = m.get(keyVal);
+          if (hit === undefined) {
+            const tmp = [];
+            renderNodes(t, scope, ctx, depth + 1, tmp);
+            hit = tmp.join('');
+            m.set(keyVal, hit);
+          }
+          out.push(hit);
+        }
         break;
       }
     }
@@ -767,6 +955,7 @@ function build(input) {
       report.push(err.message);
     }
   }
+  const memo = analyzeTemplates(templates);
   const base = input.site.base_url.replace(/\/+$/, '');
   // 1. Sumber, diurutkan code-unit; .md jadi sumber, lainnya statis.
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
@@ -925,7 +1114,8 @@ function build(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, escape: escapeHtml };
+  // Memo include hidup hanya selama satu case ini (dibuat baru per build).
+  const ctx = { templates, memo, memoConst: new Map(), memoVal: new Map() };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
